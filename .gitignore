@@ -1,0 +1,8 @@
+MdsFileShare
+MdsFileShare.exe
+*.exe
+*.dll
+*.so
+*.dylib
+.kiro
+.DS_Store
