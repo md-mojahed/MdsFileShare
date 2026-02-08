@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,10 +16,12 @@ import (
 const botToken = "8542820282:AAGuuBZOGjulWPPA5xYjczlql7hiVKrC8rU"
 
 func main() {
-	chatID := flag.String("chat", "", "Telegram chat ID (required for file sending)")
-	filePath := flag.String("file", "", "Path to file to send (required for file sending)")
+	chatID := flag.String("chat", "", "Telegram chat ID")
+	filePath := flag.String("file", "", "Path to file to send")
 	caption := flag.String("caption", "", "Optional caption for the file")
 	findText := flag.String("find", "", "Listen for messages containing this text and return chat info")
+	getFileID := flag.String("getfile", "", "Download file using file ID")
+	outputPath := flag.String("output", "", "Output path for downloaded file (optional)")
 	flag.Parse()
 
 	// Find mode
@@ -29,10 +33,25 @@ func main() {
 		return
 	}
 
+	// Download file mode
+	if *getFileID != "" {
+		if *chatID == "" {
+			fmt.Println("Error: --chat is required for downloading files")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if err := downloadFile(*chatID, *getFileID, *outputPath); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Send file mode
 	if *chatID == "" || *filePath == "" {
 		fmt.Println("Error: --chat and --file are required for sending files")
 		fmt.Println("Or use --find \"text\" to find chat IDs")
+		fmt.Println("Or use --getfile \"file_id\" to download files")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -117,12 +136,29 @@ func sendFile(chatIDStr, filePath, caption string) error {
 	}
 
 	// Send file
-	_, err = bot.Send(doc)
+	msg, err := bot.Send(doc)
 	if err != nil {
 		return fmt.Errorf("failed to send file: %v", err)
 	}
 
 	fmt.Println("✅ File sent successfully!")
+	
+	// Get file ID from the sent message
+	var fileID string
+	if msg.Document != nil {
+		fileID = msg.Document.FileID
+	}
+
+	if fileID != "" {
+		fmt.Printf("📎 File ID: %s\n", fileID)
+		
+		// Reply with file ID to the message
+		reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("📎 File ID: `%s`", fileID))
+		reply.ReplyToMessageID = msg.MessageID
+		reply.ParseMode = "Markdown"
+		bot.Send(reply)
+	}
+
 	return nil
 }
 
@@ -264,4 +300,120 @@ func getSenderName(user *tgbotapi.User) string {
 		name += " (@" + user.UserName + ")"
 	}
 	return name
+}
+
+// downloadFile downloads a file from Telegram using file ID
+func downloadFile(chatIDStr, fileID, outputPath string) error {
+	// Parse chat ID
+	var chatID int64
+	if _, err := fmt.Sscanf(chatIDStr, "%d", &chatID); err != nil {
+		return fmt.Errorf("invalid chat ID: %v", err)
+	}
+
+	fmt.Printf("📥 Downloading file...\n")
+	fmt.Printf("   File ID: %s\n", fileID)
+	fmt.Printf("   Chat ID: %s\n\n", chatIDStr)
+
+	// Initialize bot
+	bot, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		return fmt.Errorf("failed to initialize bot: %v", err)
+	}
+
+	// Get file info
+	fileConfig := tgbotapi.FileConfig{FileID: fileID}
+	file, err := bot.GetFile(fileConfig)
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %v", err)
+	}
+
+	// Determine output filename
+	var outputFile string
+	if outputPath != "" {
+		outputFile = outputPath
+	} else {
+		// Extract filename from file path or use file ID
+		if file.FilePath != "" {
+			outputFile = filepath.Base(file.FilePath)
+		} else {
+			outputFile = fileID
+		}
+	}
+
+	// Display file information
+	fmt.Println("📁 File Information:")
+	fmt.Printf("   Size: %s\n", formatSize(int64(file.FileSize)))
+	if file.FilePath != "" {
+		fmt.Printf("   Original: %s\n", filepath.Base(file.FilePath))
+	}
+	fmt.Printf("   Saving as: %s\n\n", outputFile)
+
+	// Get download URL
+	downloadURL := file.Link(bot.Token)
+
+	// Create progress bar
+	bar := progressbar.NewOptions(
+		file.FileSize,
+		progressbar.OptionSetDescription("📥 Downloading"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
+	// Download file with progress
+	resp, err := http.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download file: HTTP %d", resp.StatusCode)
+	}
+
+	// Create output file
+	out, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer out.Close()
+
+	// Copy with progress
+	reader := &downloadProgressReader{
+		reader: resp.Body,
+		bar:    bar,
+	}
+
+	_, err = io.Copy(out, reader)
+	if err != nil {
+		return fmt.Errorf("failed to save file: %v", err)
+	}
+
+	fmt.Printf("✅ File downloaded successfully!\n")
+	fmt.Printf("📂 Saved to: %s\n", outputFile)
+
+	return nil
+}
+
+// downloadProgressReader wraps an io.Reader to update progress bar for downloads
+type downloadProgressReader struct {
+	reader io.Reader
+	bar    *progressbar.ProgressBar
+}
+
+func (pr *downloadProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.bar.Add(n)
+	return n, err
 }
